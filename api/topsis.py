@@ -1,5 +1,4 @@
-from http.server import BaseHTTPRequestHandler
-import json
+from flask import Flask, request, jsonify
 import io
 import os
 import smtplib
@@ -7,9 +6,10 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-import cgi
 import pandas as pd
 import numpy as np
+
+app = Flask(__name__)
 
 
 def run_topsis(csv_content, weights_str, impacts_str):
@@ -26,7 +26,7 @@ def run_topsis(csv_content, weights_str, impacts_str):
     criteria_data = data.iloc[:, 1:]
     
     # Parse weights and impacts
-    weights = np.array(weights_str.split(","), dtype=float)
+    weights = np.array([w.strip() for w in weights_str.split(",")], dtype=float)
     impacts = [i.strip() for i in impacts_str.split(",")]
     
     if len(weights) != criteria_data.shape[1]:
@@ -125,129 +125,53 @@ TOPSIS Web Service
         server.send_message(msg)
 
 
-def parse_multipart(handler):
-    """Parse multipart form data from the request."""
-    content_type = handler.headers.get('Content-Type', '')
-    
-    if 'multipart/form-data' not in content_type:
-        raise Exception("Content-Type must be multipart/form-data")
-    
-    # Get boundary
-    boundary = None
-    for part in content_type.split(';'):
-        part = part.strip()
-        if part.startswith('boundary='):
-            boundary = part[9:]
-            if boundary.startswith('"') and boundary.endswith('"'):
-                boundary = boundary[1:-1]
-            break
-    
-    if not boundary:
-        raise Exception("No boundary found in Content-Type")
-    
-    # Read body
-    content_length = int(handler.headers.get('Content-Length', 0))
-    body = handler.rfile.read(content_length)
-    
-    # Parse fields
-    fields = {}
-    file_content = None
-    file_name = None
-    
-    boundary_bytes = ('--' + boundary).encode()
-    parts = body.split(boundary_bytes)
-    
-    for part in parts:
-        if not part or part == b'--\r\n' or part == b'--':
-            continue
+@app.route('/api/topsis', methods=['POST'])
+def topsis_handler():
+    try:
+        # Get file
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file uploaded'}), 400
         
-        # Split header and content
-        if b'\r\n\r\n' in part:
-            header, content = part.split(b'\r\n\r\n', 1)
-        elif b'\n\n' in part:
-            header, content = part.split(b'\n\n', 1)
-        else:
-            continue
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'success': False, 'error': 'No file selected'}), 400
         
-        header = header.decode('utf-8', errors='ignore')
+        # Read file content
+        file_content = file.read().decode('utf-8')
+        file_name = file.filename
         
-        # Get field name
-        name = None
-        filename = None
-        for line in header.split('\n'):
-            line = line.strip()
-            if 'Content-Disposition:' in line or 'content-disposition:' in line.lower():
-                parts_cd = line.split(';')
-                for p in parts_cd:
-                    p = p.strip()
-                    if p.startswith('name='):
-                        name = p[5:].strip('"\'')
-                    elif p.startswith('filename='):
-                        filename = p[9:].strip('"\'')
+        # Get form fields
+        weights = request.form.get('weights', '')
+        impacts = request.form.get('impacts', '')
+        email = request.form.get('email', '')
         
-        # Clean content (remove trailing CRLF)
-        content = content.rstrip(b'\r\n')
+        # Validate inputs
+        if not weights:
+            return jsonify({'success': False, 'error': 'Weights are required'}), 400
+        if not impacts:
+            return jsonify({'success': False, 'error': 'Impacts are required'}), 400
+        if not email:
+            return jsonify({'success': False, 'error': 'Email is required'}), 400
         
-        if filename:
-            file_content = content.decode('utf-8', errors='ignore')
-            file_name = filename
-        elif name:
-            fields[name] = content.decode('utf-8', errors='ignore')
-    
-    return fields, file_content, file_name
+        # Run TOPSIS
+        result_csv = run_topsis(file_content, weights, impacts)
+        
+        # Send email
+        send_email(email, result_csv, file_name)
+        
+        return jsonify({
+            'success': True,
+            'message': f'TOPSIS analysis completed! Results sent to {email}'
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
 
 
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        try:
-            # Parse multipart form data
-            fields, file_content, file_name = parse_multipart(self)
-            
-            weights = fields.get('weights', '')
-            impacts = fields.get('impacts', '')
-            email = fields.get('email', '')
-            
-            # Validate inputs
-            if not file_content:
-                raise Exception("No file uploaded")
-            if not weights:
-                raise Exception("Weights are required")
-            if not impacts:
-                raise Exception("Impacts are required")
-            if not email:
-                raise Exception("Email is required")
-            
-            # Run TOPSIS
-            result_csv = run_topsis(file_content, weights, impacts)
-            
-            # Send email
-            send_email(email, result_csv, file_name)
-            
-            # Return success response
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            response = {
-                'success': True,
-                'message': f'TOPSIS analysis completed! Results sent to {email}'
-            }
-            self.wfile.write(json.dumps(response).encode())
-            
-        except Exception as e:
-            self.send_response(400)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            response = {
-                'success': False,
-                'error': str(e)
-            }
-            self.wfile.write(json.dumps(response).encode())
-    
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        response = {
-            'message': 'TOPSIS API is running. Use POST to submit analysis.'
-        }
-        self.wfile.write(json.dumps(response).encode())
+@app.route('/api/topsis', methods=['GET'])
+def topsis_info():
+    return jsonify({'message': 'TOPSIS API is running. Use POST to submit analysis.'})
+
+
+# For Vercel
+app = app
